@@ -153,8 +153,49 @@ Practice. Для Mrs. Smith берём более простую архитек�
 - **Контекстное окно — 5** последних сообщений в промпте.
 - **Voice — `diana`**, без изменений.
 
+## Деплой: polling + free Render Web Service
+
+Проверено на практике (speechflow уже так работает стабильно):
+**long polling** (бот сам стучится в Telegram), не webhook. Free Web
+Service на Render засыпает после 15 минут без входящего HTTP — чтобы
+он не засыпал, поднимаем лёгкий HTTP-сервер (`aiohttp`, который и так
+тянется aiogram'ом — без отдельного FastAPI/uvicorn) с `/health`,
+который внешний keep-alive пингует (UptimeRobot/cron-job.org или
+аналог — настраивается отдельно от кода, не здесь).
+
+## Структура проекта — зафиксирована
+
+```
+mrs-smith/
+├── .env.example
+├── requirements.txt
+├── README.md
+├── migrations/
+│   └── 001_init.sql
+└── src/
+    ├── main.py        # Bot/Dispatcher, aiohttp /health, polling, запуск
+    ├── config.py      # env-переменные, лимиты (10/день, контекст=5)
+    ├── prompt.py       # системный промпт Mrs. Smith
+    ├── db.py           # asyncpg pool, users/messages/error_logs, rate-limit
+    ├── groq_client.py  # Groq: единый ответ (JSON: category/mistake/
+    │                   # corrected/reply_text), Session Summary, TTS,
+    │                   # think-leak guard
+    ├── keyboards.py    # Text/Translate/Original, админ-кнопки
+    ├── handlers.py     # /start, онбординг, сообщения, callback'и
+    └── admin.py        # админ-панель (статистика, разбор по категориям)
+```
+
+Техническая деталь, уточняющая "единый промпт": чтобы админ-панель
+могла агрегировать ошибки по категориям (`error_logs`), единственный
+LLM-вызов на сообщение возвращает **structured JSON**, а не просто
+текст с заголовками `[Correction]/[Conversation]` — внутри JSON есть
+и поле с готовым текстом ответа (который реально увидит/услышит
+юзер, написанный по всем её правилам речи), и отдельные поля
+category/mistake/corrected для записи в БД. Это всё ещё один вызов —
+меняется только формат вывода, не архитектура.
+
 ## Дальше
 
-Все решения зафиксированы (имя, промпт, лимиты, БД). Следующий шаг —
-структура проекта, затем сама реализация: SQL-миграции → `db.py` →
-`groq_client.py` с единым промптом → bot handlers → админ-панель.
+Все решения зафиксированы. Начинаем писать код: миграция → `config.py`
+→ `prompt.py` → `db.py` → `groq_client.py` → `keyboards.py` →
+`handlers.py` → `admin.py` → `main.py` → `README.md`.

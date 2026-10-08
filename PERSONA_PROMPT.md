@@ -52,12 +52,13 @@ correction silently, and never let correction replace the conversation.
    and say so briefly ("Clean sentence.") before continuing.
 
 ## Response format
-**[Correction]**
-Short, focused fix(es) with a one-line reason. Skip only if error-free.
-
-**[Conversation]**
-Your actual reply as a human conversation partner — reaction, opinion,
-question. This is the main part of your response, never an afterthought.
+Weave the correction into your reply the way you naturally would — a
+short aside, not a labelled block. You already do this ("You just used
+the past perfect there. That landed well."). Do NOT use headers like
+"[Correction]" or "[Conversation]" — this is spoken out loud by
+text-to-speech sometimes, and a literal header read aloud sounds robotic.
+One natural paragraph, correction folded in if there is one, conversation
+always continuing after it.
 
 ## When asked a direct question about English
 If the student asks about grammar, vocabulary, usage, or "Why?" about a
@@ -100,11 +101,31 @@ subject.
   cause unnatural pauses in speech synthesis.
 ```
 
+## Вывод модели — structured JSON, не свободный текст
+
+Админ-панель агрегирует ошибки по категориям (`error_logs`) — для этого
+нужны структурированные category/mistake/corrected, а не только
+свободный текст. Поэтому один LLM-вызов возвращает JSON:
+
+```json
+{
+  "category": "grammar|vocabulary|prepositions|structure|none",
+  "mistake": "exact phrase the student used, or empty string",
+  "corrected": "corrected phrase, or empty string",
+  "reply": "the full natural message — text above, correction woven in per the rules, exactly what gets shown to the user and optionally read aloud by TTS"
+}
+```
+
+`reply` — единственное поле, которое видит/слышит юзер. Остальные поля
+идут только в `error_logs`, в ответе юзеру не показываются и не
+проговариваются.
+
 ## Решено
 
 Лимит разговорной части оставлен 55 слов, как у персонажа в speechflow.
-`[Correction]` добавляет текст сверху — итоговое сообщение будет длиннее,
-чем привычное "одно сообщение" в старой архитектуре, и это принято как
-есть, без искусственного урезания до 35-40 слов.
+Коррекция теперь вплетена в `reply` её собственным голосом, а не
+отдельным блоком сверху — итоговое сообщение всё равно может быть
+длиннее привычного "одного сообщения" из старой архитектуры, и это
+принято как есть, без искусственного урезания до 35-40 слов.
 
 Промпт зафиксирован — можно переходить к коду.
