@@ -157,11 +157,13 @@ Practice. Для Mrs. Smith берём более простую архитек�
 
 Проверено на практике (speechflow уже так работает стабильно):
 **long polling** (бот сам стучится в Telegram), не webhook. Free Web
-Service на Render засыпает после 15 минут без входящего HTTP — чтобы
-он не засыпал, поднимаем лёгкий HTTP-сервер (`aiohttp`, который и так
-тянется aiogram'ом — без отдельного FastAPI/uvicorn) с `/health`,
-который внешний keep-alive пингует (UptimeRobot/cron-job.org или
-аналог — настраивается отдельно от кода, не здесь).
+Service на Render засыпает после 15 минут без входящего HTTP — для
+этого нужен лёгкий HTTP-сервер с `/health`, который пингует внешний
+keep-alive (UptimeRobot/cron-job.org).
+
+Готовый образец лежит в `src/health_server.py`, но **не подключён** к
+`main.py` по отдельному запросу — просто лежит, подключается вручную
+при реальном деплое (см. README.md).
 
 ## Структура проекта — зафиксирована
 
@@ -173,7 +175,8 @@ mrs-smith/
 ├── migrations/
 │   └── 001_init.sql
 └── src/
-    ├── main.py        # Bot/Dispatcher, aiohttp /health, polling, запуск
+    ├── main.py        # Bot/Dispatcher, запуск polling
+    ├── health_server.py  # образец keep-alive сервера, не подключён
     ├── config.py      # env-переменные, лимиты (10/день, контекст=5)
     ├── prompt.py       # системный промпт Mrs. Smith
     ├── db.py           # asyncpg pool, users/messages/error_logs, rate-limit

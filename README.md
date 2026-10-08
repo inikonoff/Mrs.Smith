@@ -47,9 +47,16 @@ migrations/
 ## Деплой (Render, free Web Service)
 
 Long polling + free Web Service — подробности и почему именно так в
-`PLAN.md`. Нужен внешний keep-alive (UptimeRobot / cron-job.org),
-пингующий `https://<твой-сервис>.onrender.com/health` каждые 10-14 минут,
-иначе free-сервис заснёт после 15 минут без входящего HTTP.
+`PLAN.md`. Free-сервис засыпает после 15 минут без входящего HTTP, так
+что боту нужен внешний keep-alive, пингующий какой-то `/health`.
+
+`src/health_server.py` — готовый образец такого эндпоинта
+(`aiohttp`, проверяет `db.ping()`), но он **не подключён** к
+`main.py` — лежит как есть, на случай если понадобится. Чтобы включить:
+импортировать `start_health_server` в `main.py`, вызвать рядом с
+`db.connect()`, сохранить `runner` для `runner.cleanup()` при
+остановке — и настроить внешний пингер (UptimeRobot/cron-job.org) на
+`https://<твой-сервис>.onrender.com/health` каждые 10-14 минут.
 
 `DATABASE_URL` на Render — строка подключения к Neon (не к локальному
 Docker-Postgres).
