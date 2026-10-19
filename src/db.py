@@ -2,6 +2,7 @@ import logging
 import json
 from datetime import date, datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import asyncpg
 
@@ -22,8 +23,12 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     async def connect(self) -> None:
+        kwargs = {}
+        if urlparse(settings.DATABASE_URL).port == 6543:
+            # Supabase transaction pooler (pgbouncer) не поддерживает prepared statements.
+            kwargs["statement_cache_size"] = 0
         self.pool = await asyncpg.create_pool(
-            settings.DATABASE_URL, min_size=1, max_size=5, init=self._init_connection
+            settings.DATABASE_URL, min_size=1, max_size=5, init=self._init_connection, **kwargs
         )
         logger.info("✅ Postgres pool connected")
 

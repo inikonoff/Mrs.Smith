@@ -24,7 +24,7 @@ Telegram-бот: каждый день один разговор с Mrs. Smith �
 ## Стек
 
 - Python / [aiogram](https://docs.aiogram.dev/) 3, long polling
-- Postgres ([Neon](https://neon.tech) в проде, Docker локально) через `asyncpg`, без ORM
+- Postgres ([Supabase](https://supabase.com) в проде, Docker локально) через `asyncpg`, без ORM
 - Groq API (`openai/gpt-oss-120b`) для ответов и Summary, `whisper-large-v3` для транскрибации, `canopylabs/orpheus-v1-english` для TTS
 
 ## Структура
@@ -45,7 +45,8 @@ src/
 └── admin.py         # админ-панель
 migrations/
 ├── 001_init.sql
-└── 002_sessions.sql
+├── 002_sessions.sql
+└── 003_rls.sql
 ```
 
 ## Локальный запуск
@@ -69,7 +70,7 @@ migrations/
    python -m src.main
    ```
 
-## Деплой (Render, free Web Service + Neon)
+## Деплой (Render, free Web Service + Supabase)
 
 Long polling. Free Web Service засыпает после 15 минут без входящего HTTP,
 а фоновая задача (закрытие брошенных сессий) должна жить, поэтому
@@ -79,16 +80,31 @@ Long polling. Free Web Service засыпает после 15 минут без 
    монитор типа HTTP(s) на `https://<твой-сервис>.onrender.com/health`
    с интервалом **не реже 10–14 минут** (Render засыпает через 15). Метод
    HEAD или GET — оба отвечают 200.
-2. `/health` намеренно **не обращается к БД**: пинг каждые 10 минут иначе
-   держал бы compute Neon включённым круглосуточно и тратил бесплатные
-   часы. Neon сам просыпается за ~500 мс на первый запрос. Проверка БД
-   вручную — `/health/db`.
-3. Отдельный DB keep-alive не нужен (в отличие от Supabase, который
-   ставится на паузу).
+2. `/health` намеренно **не обращается к БД**. Проверка БД вручную —
+   `/health/db`.
+3. Отдельный DB keep-alive не нужен: фоновая задача раз в 30 минут делает
+   запрос к БД, это считается активностью (free-проект Supabase ставится
+   на паузу после ~7 дней без неё). Если проект всё же встанет на паузу,
+   снимите её в дашборде.
 
-`DATABASE_URL` на Render — строка подключения к Neon
-(`?sslmode=require`), не к локальному Docker-Postgres. Миграции на Neon:
-`psql "$DATABASE_URL" -f migrations/00N_*.sql`.
+### Supabase
+
+1. Создать проект, в **Project Settings → Database → Connection string**
+   выбрать **Session pooler** и скопировать строку вида
+   `postgresql://postgres.<project-ref>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres`.
+   Спецсимволы в пароле URL-кодируются (`@` → `%40`, `#` → `%23`).
+2. Положить её в `DATABASE_URL` на Render. Прямой host
+   `db.<ref>.supabase.co` на Render free не подходит (только IPv6).
+   Transaction pooler (порт 6543) тоже работает: `db.py` сам отключает кэш
+   prepared statements.
+3. Применить миграции к Supabase с вашей машины:
+   `for f in migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done`
+   (или вставить файлы по очереди в **SQL Editor**).
+4. Данные видны в **Table Editor**: `users`, `sessions`, `messages`,
+   `error_logs`. Бот ходит в Postgres напрямую, `supabase-py` не нужен.
+   Миграция `003_rls.sql` включает RLS без политик: иначе таблицы
+   public были бы читаемы через REST-ключ anon. Боту это не мешает:
+   подключение идёт ролью `postgres`, она обходит RLS.
 
 ## Админ-панель
 
@@ -101,4 +117,4 @@ Long polling. Free Web Service засыпает после 15 минут без 
 
 Новая миграция — следующий номер в `migrations/` (`003_...sql`),
 применяется той же командой `psql "$DATABASE_URL" -f migrations/00N_*.sql`
-и локально, и на Neon. `001_init.sql` не правим.
+и локально, и на Supabase. `001_init.sql` не правим.
