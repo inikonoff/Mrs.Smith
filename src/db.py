@@ -170,17 +170,20 @@ class Database:
                 session_id, pairs_done, non_answer_streak,
             )
 
-    async def finish_session(self, session_id: int, pairs_done: int) -> Optional[Dict[str, Any]]:
+    async def finish_session(
+        self, session_id: int, pairs_done: int, reason: str = "finished"
+    ) -> Optional[Dict[str, Any]]:
         """
-        Закрывает активную сессию как finished. Атомарно: вернёт строку
-        только тому вызову, который реально закрыл сессию.
+        Закрывает активную сессию (finished — все 10 пар, early — юзер завершил
+        сам). Атомарно: вернёт строку только тому вызову, который реально
+        закрыл сессию.
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "UPDATE sessions SET status = 'completed', completion_reason = 'finished', "
+                "UPDATE sessions SET status = 'completed', completion_reason = $3, "
                 "pairs_done = $2, non_answer_streak = 0, last_activity_at = now(), "
                 "completed_at = now() WHERE id = $1 AND status = 'active' RETURNING *",
-                session_id, pairs_done,
+                session_id, pairs_done, reason,
             )
             return dict(row) if row else None
 
@@ -341,6 +344,7 @@ class Database:
                 "SELECT count(*) AS total, "
                 "count(*) FILTER (WHERE status = 'active') AS active, "
                 "count(*) FILTER (WHERE completion_reason = 'finished') AS finished, "
+                "count(*) FILTER (WHERE completion_reason = 'early') AS early, "
                 "count(*) FILTER (WHERE completion_reason = 'timeout') AS timed_out, "
                 "count(*) FILTER (WHERE user_summary IS NOT NULL) AS with_summary "
                 "FROM sessions"

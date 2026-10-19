@@ -39,6 +39,7 @@ SESSION_PAIRS = 10               # ответов юзера в сессии; р
 TIMEZONE = "Europe/Minsk"        # «день» считается по полуночи Минска
 SESSION_TIMEOUT_HOURS = 48       # без активности → сессия закрывается (timeout)
 MIN_PAIRS_FOR_TIMEOUT_SUMMARY = 3
+MIN_PAIRS_TO_FINISH_EARLY = 3   # раньше кнопка «Finish» не показывается, /finish отказывает
 MAX_CONSECUTIVE_NON_ANSWERS = 2  # потом следующее сообщение считается ответом
 SS4T_CONTEXT = 3                 # сколько последних SS4T идёт в промпт МС
 CONTEXT_MESSAGES = 24            # потолок сообщений текущей сессии в промпте (~22 + запас)

@@ -56,9 +56,11 @@ async def cq_admin_sessions(callback: CallbackQuery):
         await callback.answer()
         return
     stats = await db.get_session_stats()
-    closed = stats["finished"] + stats["timed_out"]
-    finished_pct = f"{100 * stats['finished'] / closed:.0f}%" if closed else "n/a"
-    timeout_pct = f"{100 * stats['timed_out'] / closed:.0f}%" if closed else "n/a"
+    closed = stats["finished"] + stats["early"] + stats["timed_out"]
+
+    def pct(n: int) -> str:
+        return f"{100 * n / closed:.0f}%" if closed else "n/a"
+
 
     rows = await db.get_avg_words_by_session_ordinal()
     if rows:
@@ -74,8 +76,9 @@ async def cq_admin_sessions(callback: CallbackQuery):
     text = (
         "🔟 <b>Sessions</b>\n\n"
         f"Total: {stats['total']} (active: {stats['active']})\n"
-        f"Finished: {stats['finished']} ({finished_pct})\n"
-        f"Timed out: {stats['timed_out']} ({timeout_pct})\n"
+        f"Finished (all 10): {stats['finished']} ({pct(stats['finished'])})\n"
+        f"Ended early by user: {stats['early']} ({pct(stats['early'])})\n"
+        f"Timed out: {stats['timed_out']} ({pct(stats['timed_out'])})\n"
         f"With summary: {stats['with_summary']}\n\n"
         "<b>Avg answer length (words) by session number</b>\n"
         f"<pre>{chart}</pre>"

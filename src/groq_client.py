@@ -9,7 +9,7 @@ from openai import AsyncOpenAI
 
 from src.config import CONTEXT_MESSAGES, settings
 from src.prompt import OPENING_USER_MESSAGE, SUMMARY_PROMPT, build_system_prompt
-from src.session import OPENING
+from src.session import EARLY, OPENING
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ class GroqClient:
                 raise ValueError("Missing 'reply' field")
             result["reply"] = reply.strip()
             result["counts_as_answer"] = (
-                True if mode == OPENING else bool(result.get("counts_as_answer", True))
+                True if mode in (OPENING, EARLY) else bool(result.get("counts_as_answer", True))
             )
             return result
         except Exception as e:

@@ -14,7 +14,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from src.config import SESSION_PAIRS
-from src.session import CLOSING, NORMAL, OPENING, PREFINAL
+from src.session import CLOSING, EARLY, NORMAL, OPENING, PREFINAL
 
 SYSTEM_PROMPT = """# PERSONA: MRS. SMITH
 
@@ -145,6 +145,13 @@ _TURN_BLOCKS = {
         "you will now gather your notes. Do not mention any mistakes. Set "
         "counts_as_answer to true."
     ),
+    EARLY: (
+        "The student has chosen to wrap up the session here, before the full "
+        "ten exchanges. React briefly to the last thing they said, then say a "
+        "warm goodbye. NO question and NO invitation to write more. Tell them "
+        "you will now gather your notes. Do not comment on the length of the "
+        "session and do not mention any mistakes. Set counts_as_answer to true."
+    ),
 }
 
 _FORCE_ANSWER = (
@@ -178,19 +185,20 @@ def build_system_prompt(
     if teacher_summaries:
         parts.append(MEMORY_HEADER.format(notes=format_memory(teacher_summaries)))
     turn = _TURN_BLOCKS[mode].format(reply_no=reply_no)
-    if mode != OPENING:
+    if mode not in (OPENING, EARLY):
         turn += "\n" + _NON_ANSWER_REMINDER
-    if force_answer and mode != OPENING:
+    if force_answer and mode not in (OPENING, EARLY):
         turn += "\n" + _FORCE_ANSWER
     parts.append(f"{_TURN_HEADER}\n{turn}")
     return "\n\n".join(parts)
 
 
 OPENING_USER_MESSAGE = "[The student has just opened the session. Begin.]"
+EARLY_USER_MESSAGE = "[The student has asked to wrap up the session here.]"
 
 # ─── Session Summary (SS) + Summary for Teacher (SS4T) ──────────────────────
 
-SUMMARY_PROMPT = """You are Mrs. Smith, a warm and experienced English teacher. A ten-exchange conversation with your student has just ended. You will now write two things in ONE JSON object: a personal summary for the student (user_summary) and private notes for yourself (teacher_summary). They must agree with each other.
+SUMMARY_PROMPT = """You are Mrs. Smith, a warm and experienced English teacher. A conversation with your student has just ended (up to ten exchanges; it may have been wrapped up early by the student or left unfinished, so judge only what was actually said). You will now write two things in ONE JSON object: a personal summary for the student (user_summary) and private notes for yourself (teacher_summary). They must agree with each other.
 
 You are given the full conversation (with your own lines), the mistakes silently noted during it, the student's name and self-described level, and the average length of their answers.
 

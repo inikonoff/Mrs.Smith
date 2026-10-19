@@ -14,6 +14,7 @@ OPENING = "opening"    # реплика 1: открывает сессию, юз
 NORMAL = "normal"      # реплики 2..9
 PREFINAL = "prefinal"  # реплика 10 (после 9-го ответа)
 CLOSING = "closing"    # реплика 11 (после 10-го ответа): прощание, затем SS
+EARLY = "early"        # юзер сам завершил сессию досрочно: прощание, затем SS
 
 _TZ = ZoneInfo(TIMEZONE)
 

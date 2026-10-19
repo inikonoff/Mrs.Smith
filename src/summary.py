@@ -34,7 +34,7 @@ def needs_summary(session: Dict[str, Any]) -> bool:
     """Завершённая сессия, которой положена SS, но она ещё не сгенерирована."""
     if session["status"] != "completed" or session["user_summary"]:
         return False
-    return session["completion_reason"] == "finished" or session["pairs_done"] >= 3
+    return session["completion_reason"] in ("finished", "early") or session["pairs_done"] >= 3
 
 
 def render_card(user_summary: Dict[str, Any]) -> str:

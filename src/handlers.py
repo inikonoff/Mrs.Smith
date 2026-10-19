@@ -19,6 +19,7 @@ from src.config import (
     CONTEXT_MESSAGES,
     SS4T_CONTEXT,
     MAX_CONSECUTIVE_NON_ANSWERS,
+    MIN_PAIRS_TO_FINISH_EARLY,
 )
 from src.db import db
 from src.groq_client import groq_client
@@ -28,10 +29,15 @@ from src.keyboards import (
     get_translate_shown_keyboard,
     get_start_ten_keyboard,
     get_summary_keyboard,
+    get_finish_confirm_keyboard,
+    get_status_keyboard,
+    has_finish_button,
+    FINISH_ASK_DATA,
     progress_bar,
     split_progress_bar,
 )
-from src.session import OPENING, mode_for_reply, minsk_date, reply_number, word_count
+from src.prompt import EARLY_USER_MESSAGE
+from src.session import EARLY, OPENING, mode_for_reply, minsk_date, reply_number, word_count
 from src.summary import deliver_summary, generating, needs_summary
 
 logger = logging.getLogger(__name__)
@@ -163,7 +169,10 @@ async def _send_status(target: Message, user_id: int) -> None:
     """Статус для повторного /start: ничего не сбрасывает и не запускает."""
     session = await db.get_active_session(user_id)
     if session:
-        await target.answer(_status_text(session))
+        await target.answer(
+            _status_text(session),
+            reply_markup=get_status_keyboard(_can_finish(session)),
+        )
         return
     last = await db.get_last_session(user_id)
     if _finished_today(last):
@@ -234,14 +243,112 @@ async def _show_summary(target: Message, bot: Bot, user_id: int) -> None:
     await deliver_summary(bot, session)
 
 
+# ─── Досрочное завершение («Finish the session») ─────────────────────────────
+
+@router.message(Command("finish"))
+async def cmd_finish(message: Message, bot: Bot):
+    await _request_finish(message, bot, message.from_user.id, confirmed=False)
+
+
+@router.callback_query(F.data == FINISH_ASK_DATA)
+async def cq_finish_ask(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    await _request_finish(callback.message, bot, callback.from_user.id, confirmed=False)
+
+
+@router.callback_query(F.data == "finish_yes")
+async def cq_finish_yes(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await _request_finish(callback.message, bot, callback.from_user.id, confirmed=True)
+
+
+@router.callback_query(F.data == "finish_no")
+async def cq_finish_no(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Of course. Let's go on, then.")
+
+
+async def _request_finish(target: Message, bot: Bot, user_id: int, confirmed: bool) -> None:
+    """
+    Юзер сам завершает сессию досрочно (не раньше MIN_PAIRS_TO_FINISH_EARLY пар).
+    Сначала подтверждение, потом прощальная реплика МС (пишет LLM) и Summary.
+    """
+    to_summarize: Optional[dict] = None
+    async with _user_lock(user_id):
+        if user_id in generating:
+            await target.answer(SUMMARY_BUSY_TEXT)
+            return
+        session = await db.get_active_session(user_id)
+        if not session:
+            await target.answer(
+                "There's nothing to wrap up right now.", reply_markup=get_start_ten_keyboard()
+            )
+            return
+        if not _can_finish(session):
+            await target.answer(
+                f"Let's talk a little longer first. I need at least "
+                f"{MIN_PAIRS_TO_FINISH_EARLY} exchanges to write you anything useful. "
+                f"We have {session['pairs_done']} so far."
+            )
+            return
+        if not confirmed:
+            await target.answer(
+                "Shall we wrap up here? I'll write my notes from what we've said so far.",
+                reply_markup=get_finish_confirm_keyboard(),
+            )
+            return
+        to_summarize = await _finish_early(target, session)
+    if to_summarize:
+        await deliver_summary(bot, to_summarize)
+
+
+async def _finish_early(target: Message, session: dict) -> Optional[dict]:
+    user_id = session["user_id"]
+    user = await db.get_or_create_user(user_id)
+    history = await db.get_session_dialog(session["id"], CONTEXT_MESSAGES)
+    teacher_summaries = await db.get_recent_teacher_summaries(user_id, SS4T_CONTEXT)
+
+    result = await groq_client.generate_reply(
+        EARLY_USER_MESSAGE,
+        name=user.get("name") or "",
+        level=user.get("level") or "intermediate",
+        history=history,
+        mode=EARLY,
+        reply_no=reply_number(session["pairs_done"]),
+        teacher_summaries=teacher_summaries,
+    )
+    if not result:
+        await target.answer(RETRY_TEXT)
+        return None
+
+    finished = await db.finish_session(session["id"], session["pairs_done"], reason="early")
+    if not finished:
+        return None
+    generating.add(user_id)
+    try:
+        await _send_mc_reply(target, user_id, session["id"], result["reply"], None, as_voice=False)
+    except Exception:
+        generating.discard(user_id)  # SS позже сгенерируется по /summary или сообщению юзера
+        raise
+    return finished
+
+
 # ─── Машина состояний сессии ──────────────────────────────────────────────────
 
+def _can_finish(session: dict) -> bool:
+    """Досрочно завершить можно, когда пар уже достаточно для осмысленной Summary."""
+    return session["pairs_done"] >= MIN_PAIRS_TO_FINISH_EARLY
+
+
 def _finished_today(session: Optional[dict]) -> bool:
-    """Десятка пройдена сегодня: finished и завершена в текущие сутки по Минску."""
+    """Десятка пройдена сегодня: finished/early и завершена в текущие сутки по Минску.
+    Закрытая по таймауту сессия не блокирует новую."""
     return bool(
         session
         and session["status"] == "completed"
-        and session["completion_reason"] == "finished"
+        and session["completion_reason"] in ("finished", "early")
         and session["completed_at"]
         and minsk_date(session["completed_at"]) == minsk_date()
     )
@@ -254,6 +361,7 @@ async def _send_mc_reply(
     reply: str,
     reply_no: Optional[int],
     as_voice: bool,
+    show_finish: bool = False,
 ) -> None:
     """
     Отправляет реплику МС и сохраняет её. Полоска прогресса — отдельная
@@ -272,7 +380,9 @@ async def _send_mc_reply(
             )
             await db.set_message_telegram_id(bot_msg_id, sent.message_id)
             _cache_original(sent.message_id, reply)
-            await sent.edit_reply_markup(reply_markup=get_voice_keyboard(sent.message_id))
+            await sent.edit_reply_markup(
+                reply_markup=get_voice_keyboard(sent.message_id, finish=show_finish)
+            )
             return
         body = f"💬 {html.escape(reply)}"
     else:
@@ -281,7 +391,9 @@ async def _send_mc_reply(
     sent = await target.answer(body + (f"\n\n{bar}" if bar else ""), parse_mode="HTML")
     await db.set_message_telegram_id(bot_msg_id, sent.message_id)
     _cache_original(sent.message_id, reply)
-    await sent.edit_reply_markup(reply_markup=get_text_shown_keyboard(sent.message_id))
+    await sent.edit_reply_markup(
+        reply_markup=get_text_shown_keyboard(sent.message_id, finish=show_finish)
+    )
 
 
 async def _open_session(target: Message, user: dict, as_voice: bool) -> None:
@@ -370,7 +482,8 @@ async def _continue_session(
 
     await db.advance_session(session["id"], pairs, streak)
     await _send_mc_reply(
-        target, user_id, session["id"], result["reply"], reply_number(pairs), as_voice
+        target, user_id, session["id"], result["reply"], reply_number(pairs), as_voice,
+        show_finish=pairs >= MIN_PAIRS_TO_FINISH_EARLY,
     )
     return None
 
@@ -393,7 +506,10 @@ async def _dispatch(
 
         if session:
             if text is None:
-                await target.answer(_status_text(session))
+                await target.answer(
+                    _status_text(session),
+                    reply_markup=get_status_keyboard(_can_finish(session)),
+                )
             else:
                 to_summarize = await _continue_session(target, user, session, text, as_voice)
         else:
@@ -476,15 +592,20 @@ async def cq_show_text(callback: CallbackQuery):
     if not text:
         await callback.answer("Not available.", show_alert=True)
         return
+    finish = has_finish_button(callback.message.reply_markup)
     caption = _with_bar(f"💬 {html.escape(text)}", callback.message.caption or callback.message.text)
     if len(caption) > TELEGRAM_CAPTION_LIMIT:
         # Подпись к медиа ограничена 1024 символами — длинный текст
         # (например, Session Summary) уходит отдельным сообщением.
         sent = await callback.message.answer(caption, parse_mode="HTML")
         _cache_original(sent.message_id, text)
-        await sent.edit_reply_markup(reply_markup=get_text_shown_keyboard(sent.message_id))
+        await sent.edit_reply_markup(
+            reply_markup=get_text_shown_keyboard(sent.message_id, finish=finish)
+        )
     else:
-        await _edit_display(callback.message, caption, get_text_shown_keyboard(message_id))
+        await _edit_display(
+            callback.message, caption, get_text_shown_keyboard(message_id, finish=finish)
+        )
     await callback.answer()
 
 
@@ -501,12 +622,17 @@ async def cq_translate(callback: CallbackQuery):
         translation = await groq_client.translate_text(text)
         _translations[message_id] = translation
 
+    finish = has_finish_button(callback.message.reply_markup)
     caption = _with_bar(f"🌐 {html.escape(translation)}", callback.message.caption or callback.message.text)
     if len(caption) > TELEGRAM_CAPTION_LIMIT:
         sent = await callback.message.answer(caption, parse_mode="HTML")
         _cache_original(sent.message_id, text)  # Original на новом сообщении должен работать
         _translations[sent.message_id] = translation
-        await sent.edit_reply_markup(reply_markup=get_translate_shown_keyboard(sent.message_id))
+        await sent.edit_reply_markup(
+            reply_markup=get_translate_shown_keyboard(sent.message_id, finish=finish)
+        )
     else:
-        await _edit_display(callback.message, caption, get_translate_shown_keyboard(message_id))
+        await _edit_display(
+            callback.message, caption, get_translate_shown_keyboard(message_id, finish=finish)
+        )
     await callback.answer()
