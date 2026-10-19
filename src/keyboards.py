@@ -31,13 +31,43 @@ def get_translate_shown_keyboard(message_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def get_session_summary_offer_keyboard() -> InlineKeyboardMarkup:
+def get_start_ten_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="Yes, please", callback_data="summary_yes"),
-        InlineKeyboardButton(text="No, thanks", callback_data="summary_no"),
-    )
+    builder.row(InlineKeyboardButton(text="▶️ Start the ten", callback_data="ten_start"))
     return builder.as_markup()
+
+
+def get_summary_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📋 My Session Summary", callback_data="summary_show"))
+    return builder.as_markup()
+
+
+# ─── Счётчик прогресса (первая версия — оценим в деле, формат правится здесь) ─
+
+PROGRESS_TOTAL = 10
+PROGRESS_FILLED = "●"
+PROGRESS_EMPTY = "○"
+_PROGRESS_CHARS = (PROGRESS_FILLED, PROGRESS_EMPTY)
+
+
+def progress_bar(reply_no: int) -> str:
+    """●●●○○○○○○○ — заполнено столько кружков, какой номер реплики МС (1…10)."""
+    filled = max(0, min(reply_no, PROGRESS_TOTAL))
+    return PROGRESS_FILLED * filled + PROGRESS_EMPTY * (PROGRESS_TOTAL - filled)
+
+
+def split_progress_bar(text: str) -> tuple:
+    """
+    Отделяет полоску (последняя строка из кружков) от текста подписи/сообщения.
+    Нужно кнопкам Text/Translate, чтобы не терять полоску при редактировании.
+    Возвращает (текст_без_полоски, полоска_или_пустая_строка).
+    """
+    lines = text.rstrip().split("\n")
+    last = lines[-1].strip() if lines else ""
+    if last and all(ch in _PROGRESS_CHARS for ch in last):
+        return "\n".join(lines[:-1]).rstrip(), last
+    return text, ""
 
 
 # ─── Админ-панель ────────────────────────────────────────────────────────────
@@ -46,6 +76,7 @@ def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats"))
     builder.row(InlineKeyboardButton(text="❗ Error categories", callback_data="admin_errors"))
+    builder.row(InlineKeyboardButton(text="🔟 Sessions", callback_data="admin_sessions"))
     builder.row(InlineKeyboardButton(text="👥 Users", callback_data="admin_users_0"))
     return builder.as_markup()
 

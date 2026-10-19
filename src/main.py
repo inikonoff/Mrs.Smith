@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import sys
 
@@ -10,6 +11,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from src.config import settings
 from src.db import db
 from src import handlers, admin
+from src.background import background_loop
+from src.health_server import start_health_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,10 +32,16 @@ dp.include_router(handlers.router)
 
 async def main() -> None:
     await db.connect()
+    runner = await start_health_server()
+    background = asyncio.create_task(background_loop(bot))
     try:
         logger.info("🚀 Starting polling...")
         await dp.start_polling(bot)
     finally:
+        background.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await background
+        await runner.cleanup()
         await db.close()
         await bot.session.close()
 

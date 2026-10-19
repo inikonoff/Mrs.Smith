@@ -7,19 +7,16 @@ from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
-from src.config import settings
-from src.prompt import SYSTEM_PROMPT, STUDENT_LEVEL_HEADER
+from src.config import CONTEXT_MESSAGES, settings
+from src.prompt import OPENING_USER_MESSAGE, SUMMARY_PROMPT, build_system_prompt
+from src.session import OPENING
 
 logger = logging.getLogger(__name__)
 
 MODEL = "openai/gpt-oss-120b"
 
-FALLBACK_REPLY = {
-    "category": "none",
-    "mistake": "",
-    "corrected": "",
-    "reply": "Tell me more — I'm listening.",
-}
+# Минимум слов в voice_script SS: короче — почти наверняка обрыв/мусор (известный баг Groq).
+MIN_SUMMARY_VOICE_WORDS = 40
 
 
 class GroqClient:
@@ -93,26 +90,39 @@ class GroqClient:
 
         raise Exception(f"Все Groq клиенты недоступны: {'; '.join(errors[:3])}")
 
-    # ─── Единый ответ: разговор + коррекция в одном вызове ──────────────────
+    # ─── Единый ответ: разговор + молчаливый лог ошибки в одном вызове ──────
 
     async def generate_reply(
         self,
-        text: str,
+        text: Optional[str],
+        *,
+        name: str,
         level: str,
-        history: Optional[List[Dict[str, str]]] = None,
-    ) -> Dict[str, Any]:
+        history: List[Dict[str, str]],
+        mode: str,
+        reply_no: int,
+        force_answer: bool = False,
+        teacher_summaries: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Возвращает {"category", "mistake", "corrected", "reply"}. Один
-        LLM-вызов: "reply" — то, что видит/слышит юзер (разговор с вплетённой
-        коррекцией по правилам промпта); остальные поля — только для
-        error_logs. См. PERSONA_PROMPT.md для истории решения.
+        Возвращает {"category", "mistake", "corrected", "counts_as_answer", "reply"}
+        или None, если все попытки провалились (вызывающий код не меняет
+        состояние сессии и просит юзера повторить). `text=None` — открытие
+        сессии (режим OPENING). `history` — переписка текущей сессии без
+        `text`. См. PERSONA_PROMPT.md.
         """
-        system_prompt = f"{SYSTEM_PROMPT}\n\n{STUDENT_LEVEL_HEADER.format(level=level.upper())}"
+        system_prompt = build_system_prompt(
+            name=name,
+            level=level,
+            mode=mode,
+            reply_no=reply_no,
+            force_answer=force_answer,
+            teacher_summaries=teacher_summaries,
+        )
 
         messages = [{"role": "system", "content": system_prompt}]
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": text})
+        messages.extend(history[-CONTEXT_MESSAGES:])
+        messages.append({"role": "user", "content": text if text is not None else OPENING_USER_MESSAGE})
 
         async def _chat(client):
             response = await client.chat.completions.create(
@@ -127,51 +137,61 @@ class GroqClient:
 
         try:
             result = await self._make_request(_chat)
-            if not result.get("reply"):
+            reply = result.get("reply")
+            if not isinstance(reply, str) or not reply.strip():
                 raise ValueError("Missing 'reply' field")
+            result["reply"] = reply.strip()
+            result["counts_as_answer"] = (
+                True if mode == OPENING else bool(result.get("counts_as_answer", True))
+            )
             return result
         except Exception as e:
             logger.error(f"❌ Ошибка generate_reply: {e}")
-            return dict(FALLBACK_REPLY)
+            return None
 
-    # ─── Session Summary (голосовое, авто при лимите или по запросу) ───────
+    # ─── Session Summary (SS) + Summary for Teacher (SS4T), один вызов ─────
+
+    @staticmethod
+    def _validate_summary(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Структура и защита от обрыва: короткий voice_script = провал, вызов повторится."""
+        user = data.get("user_summary")
+        teacher = data.get("teacher_summary")
+        if not isinstance(user, dict) or not isinstance(teacher, dict):
+            raise ValueError("Summary: missing user_summary / teacher_summary")
+        voice = user.get("voice_script")
+        if not isinstance(voice, str) or len(voice.split()) < MIN_SUMMARY_VOICE_WORDS:
+            raise ValueError("Summary: voice_script missing or suspiciously short")
+        if not isinstance(user.get("mistakes"), list):
+            user["mistakes"] = []
+        if not isinstance(teacher.get("errors"), list):
+            teacher["errors"] = []
+        return data
 
     async def generate_session_summary(
         self,
-        messages: List[str],
+        name: str,
+        level: str,
+        dialog: List[Dict[str, str]],
         errors: List[Dict[str, str]],
-    ) -> str:
-        if not messages:
-            return (
-                "We haven't talked enough yet for a proper summary — "
-                "let's have a real conversation first, and I'll have plenty to say."
-            )
-
-        sample = "\n".join(f"- {m}" for m in messages[-20:])
-
-        patterns = ""
-        if errors:
-            lines = [
-                f'- {e["category"]}: said "{e["mistake_text"]}" → "{e["corrected_text"]}"'
-                for e in errors[:6]
-            ]
-            patterns = "\n\nRecurring patterns from today:\n" + "\n".join(lines)
-
-        system = (
-            "You are Mrs. Smith, a warm and experienced English teacher, speaking "
-            "directly to your student as a short voice message at the end of a "
-            "practice session — not writing a report, actually talking to them.\n\n"
-            "Cover, in flowing spoken prose:\n"
-            "- What you talked about together this session\n"
-            "- Their general level and how their English sounded today\n"
-            "- One or two things they're doing well — genuine and specific, not generic praise\n"
-            "- One or two things worth practicing next time, using the patterns below if given\n\n"
-            "Speak TO them, in second person ('you'), the way a real teacher wraps up "
-            "a conversation — warm, honest, not a checklist and not a grade.\n"
-            "This will be read aloud by text-to-speech: no markdown, no headers, "
-            "no bullet points, no numbered lists — just natural spoken sentences.\n"
-            "150-220 words."
-            f"{patterns}"
+        avg_words: float,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает {"user_summary": {...}, "teacher_summary": {...}} или None
+        после всех повторов. Диалог целиком (реплики МС + ответы юзера).
+        """
+        transcript = "\n".join(
+            f'{"Mrs. Smith" if m["role"] == "assistant" else "Student"}: {m["content"]}'
+            for m in dialog
+        )
+        noted = "\n".join(
+            f'- {e["category"]}: "{e["mistake_text"]}" -> "{e["corrected_text"]}"' for e in errors
+        ) or "(none noted)"
+        user_content = (
+            f"Student name: {name or 'unknown'}\n"
+            f"Self-described level: {level or 'unknown'}\n"
+            f"Average answer length: {avg_words} words\n\n"
+            f"Mistakes noted silently during the conversation:\n{noted}\n\n"
+            f"Conversation:\n{transcript}"
         )
 
         async def _summary(client):
@@ -179,22 +199,20 @@ class GroqClient:
                 model=MODEL,
                 extra_body={"include_reasoning": False},
                 messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": f"Student messages from this session:\n{sample}"},
+                    {"role": "system", "content": SUMMARY_PROMPT},
+                    {"role": "user", "content": user_content},
                 ],
-                temperature=0.6,
-                max_tokens=500,
+                temperature=0.5,
+                max_tokens=2500,
+                response_format={"type": "json_object"},
             )
-            return self._extract_text(response, "generate_session_summary")
+            return self._validate_summary(self._extract_json(response, "generate_session_summary"))
 
         try:
             return await self._make_request(_summary)
         except Exception as e:
             logger.error(f"❌ Ошибка generate_session_summary: {e}")
-            return (
-                "I couldn't put together a proper summary right now — but I've "
-                "enjoyed our conversation today. See you next time."
-            )
+            return None
 
     # ─── Перевод (кнопка Translate) ──────────────────────────────────────────
 

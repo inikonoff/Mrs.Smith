@@ -1,12 +1,12 @@
 import logging
-from datetime import datetime, timezone, timedelta
+import json
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import asyncpg
 
 from src.config import (
     settings,
-    DAILY_PAIRS_LIMIT,
     RATE_LIMIT_WINDOW,
     RATE_LIMIT_MAX,
     RATE_LIMIT_MAX_ADMIN,
@@ -22,8 +22,17 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(settings.DATABASE_URL, min_size=1, max_size=5)
+        self.pool = await asyncpg.create_pool(
+            settings.DATABASE_URL, min_size=1, max_size=5, init=self._init_connection
+        )
         logger.info("✅ Postgres pool connected")
+
+    @staticmethod
+    async def _init_connection(conn: asyncpg.Connection) -> None:
+        # jsonb ⇄ dict (teacher_summary), без ручного json.dumps/loads в запросах
+        await conn.set_type_codec(
+            "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+        )
 
     async def close(self) -> None:
         if self.pool:
@@ -70,51 +79,6 @@ class Database:
             await conn.execute(
                 "UPDATE users SET level = $1 WHERE telegram_id = $2", level, telegram_id
             )
-
-    # ─── Дневной лимит (10 пар сообщений/сутки, см. PLAN.md) ────────────────
-
-    async def check_daily_limit(self, telegram_id: int) -> Dict[str, Any]:
-        """
-        Проверяет лимит ПЕРЕД обработкой нового сообщения юзера.
-        Сбрасывает счётчик, если наступил новый день (UTC).
-        """
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT daily_pairs_used, daily_reset_date FROM users WHERE telegram_id = $1",
-                telegram_id,
-            )
-            used = row["daily_pairs_used"]
-            reset_date = row["daily_reset_date"]
-            today = datetime.now(timezone.utc).date()
-
-            if reset_date != today:
-                await conn.execute(
-                    "UPDATE users SET daily_pairs_used = 0, daily_reset_date = $2 WHERE telegram_id = $1",
-                    telegram_id, today,
-                )
-                used = 0
-
-            return {
-                "used": used,
-                "limit": DAILY_PAIRS_LIMIT,
-                "reached": used >= DAILY_PAIRS_LIMIT,
-            }
-
-    async def increment_daily_pairs(self, telegram_id: int) -> Dict[str, Any]:
-        """
-        Вызывается ПОСЛЕ успешно отправленного ответа. Возвращает
-        just_reached_limit=True ровно в тот момент, когда счётчик впервые
-        дошёл до лимита за сегодня — на этом сообщении и только на нём
-        хендлер должен запустить авто Session Summary.
-        """
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE users SET daily_pairs_used = daily_pairs_used + 1 "
-                "WHERE telegram_id = $1 RETURNING daily_pairs_used",
-                telegram_id,
-            )
-            used = row["daily_pairs_used"]
-            return {"used": used, "just_reached_limit": used == DAILY_PAIRS_LIMIT}
 
     # ─── Burst rate-limit (защита от спама, персистентно — см. PLAN.md) ─────
 
@@ -163,13 +127,116 @@ class Database:
             )
             return {"blocked": False, "warn": (count == WARN_THRESHOLD and not is_admin)}
 
-    # ─── Messages (история для контекста + Text/Translate после рестарта) ──
+    # ─── Sessions («десятка», см. PLAN.md) ──────────────────────────────────
 
-    async def save_message(self, user_id: int, role: str, text: str) -> int:
+    async def create_session(self, user_id: int, started_date: date) -> Dict[str, Any]:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "INSERT INTO messages (user_id, role, text) VALUES ($1, $2, $3) RETURNING id",
-                user_id, role, text,
+                "INSERT INTO sessions (user_id, started_date) VALUES ($1, $2) RETURNING *",
+                user_id, started_date,
+            )
+            return dict(row)
+
+    async def get_active_session(self, user_id: int) -> Optional[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE user_id = $1 AND status = 'active'", user_id
+            )
+            return dict(row) if row else None
+
+    async def get_last_session(self, user_id: int) -> Optional[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE user_id = $1 ORDER BY started_at DESC LIMIT 1",
+                user_id,
+            )
+            return dict(row) if row else None
+
+    async def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+            return dict(row) if row else None
+
+    async def advance_session(self, session_id: int, pairs_done: int, non_answer_streak: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET pairs_done = $2, non_answer_streak = $3, "
+                "last_activity_at = now() WHERE id = $1",
+                session_id, pairs_done, non_answer_streak,
+            )
+
+    async def finish_session(self, session_id: int, pairs_done: int) -> Optional[Dict[str, Any]]:
+        """
+        Закрывает активную сессию как finished. Атомарно: вернёт строку
+        только тому вызову, который реально закрыл сессию.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE sessions SET status = 'completed', completion_reason = 'finished', "
+                "pairs_done = $2, non_answer_streak = 0, last_activity_at = now(), "
+                "completed_at = now() WHERE id = $1 AND status = 'active' RETURNING *",
+                session_id, pairs_done,
+            )
+            return dict(row) if row else None
+
+    async def close_stale_sessions(self, timeout_hours: int) -> List[Dict[str, Any]]:
+        """
+        Фоновая задача: закрывает брошенные сессии (completion_reason = timeout).
+        UPDATE ... RETURNING — каждую сессию обработает ровно один вызов.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE sessions SET status = 'completed', completion_reason = 'timeout', "
+                "completed_at = now() WHERE status = 'active' "
+                "AND last_activity_at < now() - make_interval(hours => $1) RETURNING *",
+                timeout_hours,
+            )
+            return [dict(r) for r in rows]
+
+    async def save_summary(
+        self, session_id: int, user_summary: str, teacher_summary: Dict[str, Any]
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET user_summary = $2, teacher_summary = $3 WHERE id = $1",
+                session_id, user_summary, teacher_summary,
+            )
+
+    async def get_latest_summarized_session(self, user_id: int) -> Optional[Dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE user_id = $1 AND user_summary IS NOT NULL "
+                "ORDER BY completed_at DESC NULLS LAST LIMIT 1",
+                user_id,
+            )
+            return dict(row) if row else None
+
+    async def get_recent_teacher_summaries(self, user_id: int, limit: int) -> List[Dict[str, Any]]:
+        """Последние SS4T юзера, новые первыми — память МС между сессиями."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT teacher_summary FROM sessions WHERE user_id = $1 "
+                "AND teacher_summary IS NOT NULL ORDER BY completed_at DESC NULLS LAST LIMIT $2",
+                user_id, limit,
+            )
+            return [r["teacher_summary"] for r in rows]
+
+    # ─── Messages (история сессии + Text/Translate после рестарта) ──────────
+
+    async def save_message(
+        self,
+        user_id: int,
+        role: str,
+        text: str,
+        session_id: Optional[int] = None,
+        counted: bool = False,
+        word_count: Optional[int] = None,
+    ) -> int:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO messages (user_id, role, text, session_id, counted, word_count) "
+                "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                user_id, role, text, session_id, counted, word_count,
             )
             return row["id"]
 
@@ -188,44 +255,51 @@ class Database:
             )
             return row["text"] if row else None
 
-    async def get_recent_messages(self, user_id: int, limit: int) -> List[Dict[str, str]]:
-        """Последние `limit` сообщений в хронологическом порядке, для контекста промпта."""
+    async def get_session_dialog(self, session_id: int, limit: int) -> List[Dict[str, str]]:
+        """Последние `limit` сообщений сессии в хронологическом порядке — контекст промпта."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT role, text FROM messages WHERE user_id = $1 "
-                "ORDER BY created_at DESC LIMIT $2",
-                user_id, limit,
+                "SELECT role, text FROM ("
+                "  SELECT role, text, created_at, id FROM messages WHERE session_id = $1 "
+                "  ORDER BY created_at DESC, id DESC LIMIT $2"
+                ") t ORDER BY created_at, id",
+                session_id, limit,
             )
-            return [{"role": r["role"], "content": r["text"]} for r in reversed(rows)]
+            return [{"role": r["role"], "content": r["text"]} for r in rows]
 
-    async def get_session_messages(self, user_id: int, limit: int = 50) -> List[str]:
-        """Сообщения юзера за сегодня — для Session Summary."""
+    async def get_session_answer_stats(self, session_id: int) -> Dict[str, Any]:
+        """Средняя длина засчитанных ответов юзера в сессии (слов)."""
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT text FROM messages WHERE user_id = $1 AND role = 'user' "
-                "AND created_at >= date_trunc('day', now()) "
-                "ORDER BY created_at DESC LIMIT $2",
-                user_id, limit,
+            row = await conn.fetchrow(
+                "SELECT count(*) AS n, coalesce(avg(word_count), 0)::float AS avg_words "
+                "FROM messages WHERE session_id = $1 AND role = 'user' AND counted",
+                session_id,
             )
-            return [r["text"] for r in reversed(rows)]
+            return {"answers": row["n"], "avg_words": round(row["avg_words"], 1)}
 
-    # ─── Error log (для Session Summary и админ-панели) ─────────────────────
+    # ─── Error log (для SS и админ-панели) ──────────────────────────────────
 
-    async def log_error(self, user_id: int, category: str, mistake: str, corrected: str) -> None:
+    async def log_error(
+        self,
+        user_id: int,
+        category: str,
+        mistake: str,
+        corrected: str,
+        session_id: Optional[int] = None,
+    ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO error_logs (user_id, category, mistake_text, corrected_text) "
-                "VALUES ($1, $2, $3, $4)",
-                user_id, category, mistake, corrected,
+                "INSERT INTO error_logs (user_id, category, mistake_text, corrected_text, session_id) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                user_id, category, mistake, corrected, session_id,
             )
 
-    async def get_session_errors(self, user_id: int, limit: int = 20) -> List[Dict[str, str]]:
+    async def get_session_errors(self, session_id: int, limit: int = 30) -> List[Dict[str, str]]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT category, mistake_text, corrected_text FROM error_logs "
-                "WHERE user_id = $1 AND created_at >= date_trunc('day', now()) "
-                "ORDER BY created_at DESC LIMIT $2",
-                user_id, limit,
+                "WHERE session_id = $1 ORDER BY created_at LIMIT $2",
+                session_id, limit,
             )
             return [dict(r) for r in rows]
 
@@ -255,6 +329,39 @@ class Database:
                 "levels": {r["level"]: r["n"] for r in level_rows},
             }
 
+    async def get_session_stats(self) -> Dict[str, Any]:
+        """Сессии: сколько всего, доля завершённых против таймаутов."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT count(*) AS total, "
+                "count(*) FILTER (WHERE status = 'active') AS active, "
+                "count(*) FILTER (WHERE completion_reason = 'finished') AS finished, "
+                "count(*) FILTER (WHERE completion_reason = 'timeout') AS timed_out, "
+                "count(*) FILTER (WHERE user_summary IS NOT NULL) AS with_summary "
+                "FROM sessions"
+            )
+            return dict(row)
+
+    async def get_avg_words_by_session_ordinal(self, max_ordinal: int = 10) -> List[Dict[str, Any]]:
+        """
+        Главная дипломная метрика: средняя длина ответа юзера (слов) по
+        порядковому номеру сессии юзера (1-я, 2-я, ...) — «разговорился ли».
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "WITH ranked AS ("
+                "  SELECT id, row_number() OVER (PARTITION BY user_id ORDER BY started_at) AS ordinal "
+                "  FROM sessions"
+                ") "
+                "SELECT r.ordinal, avg(m.word_count)::float AS avg_words, "
+                "count(DISTINCT m.session_id) AS sessions, count(*) AS answers "
+                "FROM messages m JOIN ranked r ON r.id = m.session_id "
+                "WHERE m.role = 'user' AND m.counted AND m.word_count IS NOT NULL "
+                "AND r.ordinal <= $1 GROUP BY r.ordinal ORDER BY r.ordinal",
+                max_ordinal,
+            )
+            return [dict(r) for r in rows]
+
     async def get_error_category_breakdown(self, limit: int = 10) -> List[Dict[str, Any]]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
@@ -277,10 +384,21 @@ class Database:
                 "WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5",
                 telegram_id,
             )
+            sessions = await conn.fetch(
+                "SELECT id, status, completion_reason, pairs_done, started_at, "
+                "teacher_summary->>'level_estimate' AS level_estimate FROM sessions "
+                "WHERE user_id = $1 ORDER BY started_at DESC LIMIT 5",
+                telegram_id,
+            )
+            session_total = await conn.fetchval(
+                "SELECT count(*) FROM sessions WHERE user_id = $1", telegram_id
+            )
             return {
                 "user": dict(user),
                 "message_count": message_count,
                 "recent_errors": [dict(r) for r in recent_errors],
+                "recent_sessions": [dict(r) for r in sessions],
+                "session_total": session_total,
             }
 
     async def list_users(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:

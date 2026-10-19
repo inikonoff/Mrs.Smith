@@ -1,14 +1,12 @@
 """
-Образец keep-alive сервера для free Render Web Service — НЕ подключён
-к боту (main.py запускает только long polling, без этого). Free
-сервис засыпает после 15 минут без входящего HTTP; этот /health
-существовал бы для внешнего пингера (UptimeRobot/cron-job.org), чтобы
-такая настройка была под рукой, если бот заснёт в проде и понадобится
-быстро её подключить.
+Keep-alive сервер для free Render Web Service. Подключён к main.py: free
+сервис засыпает после 15 минут без входящего HTTP, а фоновая задача (закрытие
+брошенных сессий) должна жить, поэтому внешний пингер (UptimeRobot /
+cron-job.org) бьёт в /health каждые 10–14 минут.
 
-Чтобы включить: импортировать start_health_server в main.py, вызвать
-его рядом с db.connect() и сохранить runner для runner.cleanup() при
-остановке (как было сделано изначально, до переноса сюда).
+/health отвечает на GET и HEAD и НЕ трогает БД: пинг каждые 10 минут иначе
+держал бы compute Neon включённым круглосуточно. Глубокая проверка с БД —
+/health/db (для ручной диагностики, не для пингера).
 """
 
 import logging
@@ -22,14 +20,21 @@ logger = logging.getLogger(__name__)
 
 
 async def health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "service": "daily-ten"})
+
+
+async def health_db(request: web.Request) -> web.Response:
     ok = await db.ping()
     return web.json_response({"status": "ok" if ok else "degraded"}, status=200 if ok else 503)
 
 
 async def start_health_server() -> web.AppRunner:
     app = web.Application()
+    # add_get регистрирует и HEAD (allow_head=True по умолчанию).
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/ping", health)
+    app.router.add_get("/health/db", health_db)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", settings.PORT)

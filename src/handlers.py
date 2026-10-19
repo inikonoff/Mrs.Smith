@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 from typing import Dict, Optional
@@ -9,14 +10,29 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from src.config import ADMIN_IDS, VOICE, DISPLAY_NAME, CONTEXT_WINDOW, DAILY_PAIRS_LIMIT
+from src.config import (
+    ADMIN_IDS,
+    VOICE,
+    DISPLAY_NAME,
+    PRODUCT_NAME,
+    SESSION_PAIRS,
+    CONTEXT_MESSAGES,
+    SS4T_CONTEXT,
+    MAX_CONSECUTIVE_NON_ANSWERS,
+)
 from src.db import db
 from src.groq_client import groq_client
 from src.keyboards import (
     get_voice_keyboard,
     get_text_shown_keyboard,
     get_translate_shown_keyboard,
+    get_start_ten_keyboard,
+    get_summary_keyboard,
+    progress_bar,
+    split_progress_bar,
 )
+from src.session import OPENING, mode_for_reply, minsk_date, reply_number, word_count
+from src.summary import deliver_summary, generating, needs_summary
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -27,10 +43,24 @@ router = Router()
 # закладываем защиту сразу, а не после жалоб пользователей.
 TELEGRAM_CAPTION_LIMIT = 1024
 
+SUMMARY_BUSY_TEXT = "One moment, I'm gathering my notes."
+RETRY_TEXT = "Forgive me, I lost my thread for a moment. Could you say that once more?"
+
 # In-memory кэш текста под кнопками Text/Translate — быстрый путь, с
 # фоллбэком на БД (messages.telegram_message_id) после рестарта процесса.
 _originals: Dict[int, str] = {}
 _translations: Dict[int, str] = {}
+
+# Один юзер — один обработчик за раз: счётчик пар и состояние сессии нельзя
+# менять параллельно (aiogram обрабатывает апдейты конкурентно).
+_user_locks: Dict[int, asyncio.Lock] = {}
+
+
+def _user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = _user_locks[user_id] = asyncio.Lock()
+    return lock
 
 
 async def _edit_display(message: Message, new_content: str, reply_markup) -> None:
@@ -80,20 +110,16 @@ def _level_keyboard():
     return builder.as_markup()
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    user = await db.get_or_create_user(message.from_user.id)
-    if user["name"] and user["level"]:
-        await message.answer(f"Welcome back. I'm {DISPLAY_NAME} — ready when you are.")
-        return
+async def _begin_onboarding(message: Message, state: FSMContext) -> None:
     await state.set_state(Onboarding.waiting_name)
     await message.answer(
-        f"Hello, I'm {DISPLAY_NAME}. I'll be your English teacher here — "
-        f"we'll talk, and I'll help you along the way. What should I call you?"
+        f"Hello, I'm {DISPLAY_NAME}, and this is {PRODUCT_NAME}. Each day we have "
+        f"one conversation of ten exchanges, and at the end I write you my "
+        f"notes on your English. What should I call you?"
     )
 
 
-@router.message(Onboarding.waiting_name)
+@router.message(Onboarding.waiting_name, F.text, ~F.text.startswith("/"))
 async def onboarding_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()[:100]
     if not name:
@@ -108,54 +134,290 @@ async def onboarding_name(message: Message, state: FSMContext):
 
 
 @router.callback_query(Onboarding.waiting_level, F.data.startswith("level_"))
-async def onboarding_level(callback: CallbackQuery, state: FSMContext):
+async def onboarding_level(callback: CallbackQuery, state: FSMContext, bot: Bot):
     level = callback.data.removeprefix("level_")
     await db.set_level(callback.from_user.id, level)
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("Good. Then let's begin — tell me something about your day.")
     await callback.answer()
+    await _dispatch(callback.message, bot, callback.from_user.id, text=None, as_voice=False)
 
 
-# ─── Основной разговор ────────────────────────────────────────────────────────
+# ─── Команды ──────────────────────────────────────────────────────────────────
 
-async def _send_session_summary(message: Message, user_id: int, auto: bool = False) -> None:
-    if auto:
-        # Это сообщение, на котором счётчик дошёл до дневного лимита —
-        # объясняем, почему сейчас приходит саммари, вместо того чтобы
-        # просто вывалить его без контекста сразу после обычного ответа.
-        await message.answer(
-            f"That's your {DAILY_PAIRS_LIMIT} exchanges for today — a good "
-            f"stopping point. Before you go, let me tell you how it went."
+def _status_text(session: dict) -> str:
+    reply_no = min(reply_number(session["pairs_done"]), SESSION_PAIRS)
+    return f"We're in the middle of today's ten. Reply {reply_no} of {SESSION_PAIRS}.\n\n{progress_bar(reply_no)}"
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    user = await db.get_or_create_user(message.from_user.id)
+    if not (user["name"] and user["level"]):
+        await _begin_onboarding(message, state)
+        return
+    await _send_status(message, message.from_user.id)
+
+
+async def _send_status(target: Message, user_id: int) -> None:
+    """Статус для повторного /start: ничего не сбрасывает и не запускает."""
+    session = await db.get_active_session(user_id)
+    if session:
+        await target.answer(_status_text(session))
+        return
+    last = await db.get_last_session(user_id)
+    if _finished_today(last):
+        await target.answer(
+            "Today's ten is done. The next one is tomorrow.",
+            reply_markup=get_summary_keyboard(),
         )
+        return
+    await target.answer(
+        "Ready for a new ten whenever you are.", reply_markup=get_start_ten_keyboard()
+    )
 
-    session_messages = await db.get_session_messages(user_id)
-    session_errors = await db.get_session_errors(user_id)
-    summary_text = await groq_client.generate_session_summary(session_messages, session_errors)
 
-    voice_bytes = await groq_client.text_to_speech(summary_text, voice=VOICE)
-    if voice_bytes:
-        voice_file = BufferedInputFile(voice_bytes, filename="summary.wav")
-        sent = await message.answer_voice(
-            voice_file,
-            caption=f"🎙 {DISPLAY_NAME} — Session Summary",
-        )
-        msg_id = await db.save_message(user_id, "assistant", summary_text)
-        await db.set_message_telegram_id(msg_id, sent.message_id)
-        _cache_original(sent.message_id, summary_text)
-        await sent.edit_reply_markup(reply_markup=get_voice_keyboard(sent.message_id))
-    else:
-        safe = html.escape(summary_text)
-        await message.answer(safe, parse_mode="HTML")
+@router.message(Command("ten"))
+async def cmd_ten(message: Message, state: FSMContext, bot: Bot):
+    await _request_ten(message, state, bot, message.from_user.id)
+
+
+@router.callback_query(F.data == "ten_start")
+async def cq_ten_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    await _request_ten(callback.message, state, bot, callback.from_user.id)
+
+
+async def _request_ten(target: Message, state: FSMContext, bot: Bot, user_id: int) -> None:
+    user = await db.get_or_create_user(user_id)
+    if not (user["name"] and user["level"]):
+        await _begin_onboarding(target, state)
+        return
+    if await state.get_state() is not None:
+        await state.clear()
+    await _dispatch(target, bot, user_id, text=None, as_voice=False)
 
 
 @router.message(Command("summary"))
-async def cmd_summary(message: Message):
-    await message.answer("One moment...")
-    await _send_session_summary(message, message.from_user.id)
+async def cmd_summary(message: Message, bot: Bot):
+    await _show_summary(message, bot, message.from_user.id)
 
 
-async def _process_turn(message: Message, bot: Bot, user_text: str, reply_as_voice: bool) -> None:
+@router.callback_query(F.data == "summary_show")
+async def cq_summary_show(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    await _show_summary(callback.message, bot, callback.from_user.id)
+
+
+async def _show_summary(target: Message, bot: Bot, user_id: int) -> None:
+    if user_id in generating:
+        await target.answer(SUMMARY_BUSY_TEXT)
+        return
+    async with _user_lock(user_id):
+        if user_id in generating:
+            await target.answer(SUMMARY_BUSY_TEXT)
+            return
+        last = await db.get_last_session(user_id)
+        if last and needs_summary(last):
+            # SS не сгенерировалась в прошлый раз — пробуем ещё раз.
+            session = last
+        else:
+            session = await db.get_latest_summarized_session(user_id)
+        if not session:
+            if await db.get_active_session(user_id):
+                await target.answer(f"My notes come after the {SESSION_PAIRS}th reply. We're not there yet.")
+            else:
+                await target.answer("There's no summary yet. Start a ten and I'll write you one.",
+                                    reply_markup=get_start_ten_keyboard())
+            return
+        generating.add(user_id)
+    await deliver_summary(bot, session)
+
+
+# ─── Машина состояний сессии ──────────────────────────────────────────────────
+
+def _finished_today(session: Optional[dict]) -> bool:
+    """Десятка пройдена сегодня: finished и завершена в текущие сутки по Минску."""
+    return bool(
+        session
+        and session["status"] == "completed"
+        and session["completion_reason"] == "finished"
+        and session["completed_at"]
+        and minsk_date(session["completed_at"]) == minsk_date()
+    )
+
+
+async def _send_mc_reply(
+    target: Message,
+    user_id: int,
+    session_id: int,
+    reply: str,
+    reply_no: Optional[int],
+    as_voice: bool,
+) -> None:
+    """
+    Отправляет реплику МС и сохраняет её. Полоска прогресса — отдельная
+    последняя строка (в голосовом — в подписи, в TTS не попадает);
+    `reply_no=None` — без полоски (закрывающая реплика).
+    """
+    bar = progress_bar(reply_no) if reply_no else ""
+    bot_msg_id = await db.save_message(user_id, "assistant", reply, session_id=session_id)
+
+    if as_voice:
+        voice_bytes = await groq_client.text_to_speech(reply, voice=VOICE)
+        if voice_bytes:
+            caption = f"🎙 {DISPLAY_NAME}" + (f"\n{bar}" if bar else "")
+            sent = await target.answer_voice(
+                BufferedInputFile(voice_bytes, filename="reply.wav"), caption=caption
+            )
+            await db.set_message_telegram_id(bot_msg_id, sent.message_id)
+            _cache_original(sent.message_id, reply)
+            await sent.edit_reply_markup(reply_markup=get_voice_keyboard(sent.message_id))
+            return
+        body = f"💬 {html.escape(reply)}"
+    else:
+        body = html.escape(reply)
+
+    sent = await target.answer(body + (f"\n\n{bar}" if bar else ""), parse_mode="HTML")
+    await db.set_message_telegram_id(bot_msg_id, sent.message_id)
+    _cache_original(sent.message_id, reply)
+    await sent.edit_reply_markup(reply_markup=get_text_shown_keyboard(sent.message_id))
+
+
+async def _open_session(target: Message, user: dict, as_voice: bool) -> None:
+    """Новая сессия: МС открывает её сама, опираясь на последние SS4T."""
+    user_id = user["telegram_id"]
+    teacher_summaries = await db.get_recent_teacher_summaries(user_id, SS4T_CONTEXT)
+    result = await groq_client.generate_reply(
+        None,
+        name=user.get("name") or "",
+        level=user.get("level") or "intermediate",
+        history=[],
+        mode=OPENING,
+        reply_no=reply_number(0),
+        teacher_summaries=teacher_summaries,
+    )
+    if not result:
+        # Сессию не создаём: иначе остался бы «активный» разговор без реплики МС.
+        await target.answer("Forgive me, I couldn't start our conversation just now. Try /ten again in a moment.")
+        return
+    session = await db.create_session(user_id, minsk_date())
+    await _send_mc_reply(target, user_id, session["id"], result["reply"], reply_number(0), as_voice)
+
+
+async def _continue_session(
+    target: Message, user: dict, session: dict, text: str, as_voice: bool
+) -> Optional[dict]:
+    """
+    Сообщение юзера в активной сессии. Возвращает сессию, для которой надо
+    отправить SS (после закрывающей реплики), иначе None.
+    """
+    user_id = user["telegram_id"]
+    pairs = session["pairs_done"]
+    streak = session["non_answer_streak"]
+    force = streak >= MAX_CONSECUTIVE_NON_ANSWERS
+
+    # Режим выбираем до вызова LLM, по предположению «сообщение засчитается».
+    prospective_reply_no = reply_number(pairs + 1)
+    history = await db.get_session_dialog(session["id"], CONTEXT_MESSAGES)
+    teacher_summaries = await db.get_recent_teacher_summaries(user_id, SS4T_CONTEXT)
+
+    result = await groq_client.generate_reply(
+        text,
+        name=user.get("name") or "",
+        level=user.get("level") or "intermediate",
+        history=history,
+        mode=mode_for_reply(prospective_reply_no),
+        reply_no=prospective_reply_no,
+        force_answer=force,
+        teacher_summaries=teacher_summaries,
+    )
+    if not result:
+        # Ничего не сохраняем и счётчик не трогаем: юзер просто повторит.
+        await target.answer(RETRY_TEXT)
+        return None
+
+    counts = True if force else result["counts_as_answer"]
+
+    await db.save_message(
+        user_id, "user", text,
+        session_id=session["id"], counted=counts, word_count=word_count(text),
+    )
+    if result.get("category") not in (None, "none", "") and result.get("mistake"):
+        await db.log_error(
+            user_id, result["category"], result["mistake"], result.get("corrected", ""),
+            session_id=session["id"],
+        )
+
+    if counts:
+        pairs += 1
+        streak = 0
+    else:
+        streak += 1
+
+    if counts and pairs >= SESSION_PAIRS:
+        # Закрывающая реплика: закрываем сессию атомарно ДО отправки, чтобы
+        # сообщения юзера не считались ответами, пока МС прощается и пишет SS.
+        finished = await db.finish_session(session["id"], pairs)
+        if finished:
+            generating.add(user_id)
+        try:
+            await _send_mc_reply(target, user_id, session["id"], result["reply"], None, as_voice)
+        except Exception:
+            generating.discard(user_id)  # SS позже сгенерируется по /summary или сообщению юзера
+            raise
+        return finished
+
+    await db.advance_session(session["id"], pairs, streak)
+    await _send_mc_reply(
+        target, user_id, session["id"], result["reply"], reply_number(pairs), as_voice
+    )
+    return None
+
+
+async def _dispatch(
+    target: Message, bot: Bot, user_id: int, text: Optional[str], as_voice: bool
+) -> None:
+    """
+    Единая точка входа. `text` — сообщение юзера; `text=None` — явный запрос
+    десятки (/ten, кнопка, конец онбординга), он ответом не считается.
+    """
+    to_summarize: Optional[dict] = None
+    async with _user_lock(user_id):
+        if user_id in generating:
+            await target.answer(SUMMARY_BUSY_TEXT)
+            return
+
+        user = await db.get_or_create_user(user_id)
+        session = await db.get_active_session(user_id)
+
+        if session:
+            if text is None:
+                await target.answer(_status_text(session))
+            else:
+                to_summarize = await _continue_session(target, user, session, text, as_voice)
+        else:
+            last = await db.get_last_session(user_id)
+            if last and needs_summary(last):
+                # SS не сгенерировалась в прошлый раз — повторяем, новую не начинаем.
+                generating.add(user_id)
+                to_summarize = last
+            elif _finished_today(last):
+                await target.answer(
+                    "That's your ten for today. We'll start the next one tomorrow.",
+                    reply_markup=get_summary_keyboard(),
+                )
+            else:
+                # Новая сессия. Сообщение, которое её вызвало, ответом не считается.
+                await _open_session(target, user, as_voice)
+
+    if to_summarize:
+        await deliver_summary(bot, to_summarize)
+
+
+async def _handle_input(
+    message: Message, state: FSMContext, bot: Bot, text: str, as_voice: bool
+) -> None:
     user_id = message.from_user.id
     is_admin = user_id in ADMIN_IDS
 
@@ -165,49 +427,13 @@ async def _process_turn(message: Message, bot: Bot, user_text: str, reply_as_voi
     if burst["warn"]:
         await message.answer("You're sending messages very fast — slow down a little so I can keep up.")
 
-    daily = await db.check_daily_limit(user_id)
-    if daily["reached"]:
-        await message.answer(
-            f"That's your {DAILY_PAIRS_LIMIT} exchanges for today — come back "
-            f"tomorrow and we'll pick up right where we left off."
-        )
+    user = await db.get_or_create_user(user_id)
+    if not (user["name"] and user["level"]):
+        # Онбординг не пройден (например, FSM-состояние потерялось при рестарте).
+        await _begin_onboarding(message, state)
         return
 
-    user = await db.get_or_create_user(user_id)
-    history = await db.get_recent_messages(user_id, CONTEXT_WINDOW)
-
-    result = await groq_client.generate_reply(user_text, user.get("level") or "intermediate", history)
-
-    await db.save_message(user_id, "user", user_text)
-    bot_msg_id = await db.save_message(user_id, "assistant", result["reply"])
-
-    if result.get("category") not in (None, "none", "") and result.get("mistake"):
-        await db.log_error(user_id, result["category"], result["mistake"], result.get("corrected", ""))
-
-    if reply_as_voice:
-        voice_bytes = await groq_client.text_to_speech(result["reply"], voice=VOICE)
-        if voice_bytes:
-            voice_file = BufferedInputFile(voice_bytes, filename="reply.wav")
-            sent = await message.answer_voice(voice_file, caption=f"🎙 {DISPLAY_NAME}")
-            await db.set_message_telegram_id(bot_msg_id, sent.message_id)
-            _cache_original(sent.message_id, result["reply"])
-            await sent.edit_reply_markup(reply_markup=get_voice_keyboard(sent.message_id))
-        else:
-            safe = html.escape(result["reply"])
-            sent = await message.answer(f"💬 {safe}", parse_mode="HTML")
-            await db.set_message_telegram_id(bot_msg_id, sent.message_id)
-            _cache_original(sent.message_id, result["reply"])
-            await sent.edit_reply_markup(reply_markup=get_text_shown_keyboard(sent.message_id))
-    else:
-        safe = html.escape(result["reply"])
-        sent = await message.answer(safe, parse_mode="HTML")
-        await db.set_message_telegram_id(bot_msg_id, sent.message_id)
-        _cache_original(sent.message_id, result["reply"])
-        await sent.edit_reply_markup(reply_markup=get_text_shown_keyboard(sent.message_id))
-
-    inc = await db.increment_daily_pairs(user_id)
-    if inc["just_reached_limit"]:
-        await _send_session_summary(message, user_id, auto=True)
+    await _dispatch(message, bot, user_id, text=text, as_voice=as_voice)
 
 
 @router.message(F.voice)
@@ -215,13 +441,16 @@ async def handle_voice(message: Message, state: FSMContext, bot: Bot):
     if await state.get_state() is not None:
         await message.answer("Text works better while we're getting set up — go ahead.")
         return
+    if message.from_user.id in generating:
+        await message.answer(SUMMARY_BUSY_TEXT)
+        return
     file = await bot.get_file(message.voice.file_id)
     audio_bytes = (await bot.download_file(file.file_path)).read()
     text = await groq_client.transcribe_audio(audio_bytes)
     if not text:
         await message.answer("I couldn't quite hear that — mind trying again?")
         return
-    await _process_turn(message, bot, text, reply_as_voice=True)
+    await _handle_input(message, state, bot, text, as_voice=True)
 
 
 @router.message(F.text)
@@ -229,10 +458,16 @@ async def handle_text(message: Message, state: FSMContext, bot: Bot):
     if await state.get_state() is not None:
         await message.answer("Go ahead and tap one of the buttons above.")
         return
-    await _process_turn(message, bot, message.text, reply_as_voice=False)
+    await _handle_input(message, state, bot, message.text, as_voice=False)
 
 
 # ─── Text / Translate кнопки ──────────────────────────────────────────────────
+
+def _with_bar(caption: str, current: Optional[str]) -> str:
+    """Сохраняет полоску прогресса реплики при редактировании подписи/текста."""
+    _, bar = split_progress_bar(current or "")
+    return f"{caption}\n\n{bar}" if bar else caption
+
 
 @router.callback_query(F.data.startswith("text_"))
 async def cq_show_text(callback: CallbackQuery):
@@ -241,8 +476,7 @@ async def cq_show_text(callback: CallbackQuery):
     if not text:
         await callback.answer("Not available.", show_alert=True)
         return
-    safe = html.escape(text)
-    caption = f"💬 {safe}"
+    caption = _with_bar(f"💬 {html.escape(text)}", callback.message.caption or callback.message.text)
     if len(caption) > TELEGRAM_CAPTION_LIMIT:
         # Подпись к медиа ограничена 1024 символами — длинный текст
         # (например, Session Summary) уходит отдельным сообщением.
@@ -267,8 +501,7 @@ async def cq_translate(callback: CallbackQuery):
         translation = await groq_client.translate_text(text)
         _translations[message_id] = translation
 
-    safe = html.escape(translation)
-    caption = f"🌐 {safe}"
+    caption = _with_bar(f"🌐 {html.escape(translation)}", callback.message.caption or callback.message.text)
     if len(caption) > TELEGRAM_CAPTION_LIMIT:
         sent = await callback.message.answer(caption, parse_mode="HTML")
         _cache_original(sent.message_id, text)  # Original на новом сообщении должен работать

@@ -1,3 +1,5 @@
+import html
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -43,6 +45,40 @@ async def cq_admin_stats(callback: CallbackQuery):
         f"Active this week: {stats['active_week']}\n"
         f"Messages today: {stats['messages_today']}\n\n"
         f"By level:\n{levels}"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admin_back_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_sessions")
+async def cq_admin_sessions(callback: CallbackQuery):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    stats = await db.get_session_stats()
+    closed = stats["finished"] + stats["timed_out"]
+    finished_pct = f"{100 * stats['finished'] / closed:.0f}%" if closed else "n/a"
+    timeout_pct = f"{100 * stats['timed_out'] / closed:.0f}%" if closed else "n/a"
+
+    rows = await db.get_avg_words_by_session_ordinal()
+    if rows:
+        top = max(r["avg_words"] for r in rows) or 1
+        chart = "\n".join(
+            f"#{r['ordinal']:<2} {'█' * max(1, round(10 * r['avg_words'] / top)):<10} "
+            f"{r['avg_words']:.1f} ({r['sessions']} s.)"
+            for r in rows
+        )
+    else:
+        chart = "(no answers yet)"
+
+    text = (
+        "🔟 <b>Sessions</b>\n\n"
+        f"Total: {stats['total']} (active: {stats['active']})\n"
+        f"Finished: {stats['finished']} ({finished_pct})\n"
+        f"Timed out: {stats['timed_out']} ({timeout_pct})\n"
+        f"With summary: {stats['with_summary']}\n\n"
+        "<b>Avg answer length (words) by session number</b>\n"
+        f"<pre>{chart}</pre>"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admin_back_keyboard())
     await callback.answer()
@@ -94,16 +130,24 @@ async def cq_admin_user_card(callback: CallbackQuery):
     u = card["user"]
     errors = card["recent_errors"]
     error_lines = "\n".join(
-        f"  • {e['category']}: \"{e['mistake_text']}\" → \"{e['corrected_text']}\""
+        f"  • {e['category']}: \"{html.escape(e['mistake_text'])}\" → \"{html.escape(e['corrected_text'])}\""
         for e in errors
     ) or "  (none logged)"
 
+    session_lines = "\n".join(
+        f"  • #{s['id']} {s['status']}"
+        f"{'/' + s['completion_reason'] if s['completion_reason'] else ''}, "
+        f"pairs {s['pairs_done']}, level {s['level_estimate'] or '—'}"
+        for s in card["recent_sessions"]
+    ) or "  (none yet)"
+
     text = (
-        f"👤 <b>{u['name'] or 'Unnamed'}</b> ({u['telegram_id']})\n\n"
-        f"Level: {u['level'] or 'unset'}\n"
+        f"👤 <b>{html.escape(u['name'] or 'Unnamed')}</b> ({u['telegram_id']})\n\n"
+        f"Level (self-described): {u['level'] or 'unset'}\n"
         f"Messages: {card['message_count']}\n"
-        f"Last active: {u['last_active']}\n"
-        f"Today's pairs used: {u['daily_pairs_used']}\n\n"
+        f"Sessions: {card['session_total']}\n"
+        f"Last active: {u['last_active']}\n\n"
+        f"Recent sessions:\n{session_lines}\n\n"
         f"Recent errors:\n{error_lines}"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admin_back_keyboard())
